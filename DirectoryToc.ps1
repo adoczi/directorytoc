@@ -84,6 +84,18 @@ function Fail([string]$Message) {
     exit 1
 }
 
+function Write-Para($Writer, [string]$Text, [string]$Rpr, [string]$Ppr) {
+    # Emits one <w:p> paragraph; empty $Text yields a text-less paragraph.
+    $p = '<w:p>'
+    if ($Ppr)  { $p += '<w:pPr>' + $Ppr + '</w:pPr>' }
+    if ($Text) {
+        $p += '<w:r>'
+        if ($Rpr) { $p += '<w:rPr>' + $Rpr + '</w:rPr>' }
+        $p += '<w:t xml:space="preserve">' + (Esc $Text) + '</w:t></w:r>'
+    }
+    $Writer.Write($p + '</w:p>')
+}
+
 # --- Validate and normalize input ----------------------------------------------
 
 $cwd = (Get-Location).ProviderPath
@@ -120,6 +132,24 @@ if ([System.IO.Path]::GetExtension($OutputFile) -ne '.docx') {
 Write-Host "Directory : $Directory" -ForegroundColor Cyan
 Write-Host "Output    : $OutputFile" -ForegroundColor Cyan
 
+# Probe catches output files that cannot be written *before* the slow scan, so
+# users do not wait minutes only to learn the file is open in Word.
+if (Test-Path -LiteralPath $OutputFile -PathType Container) {
+    Fail "Output path is a directory: '$OutputFile'"
+}
+if (Test-Path -LiteralPath $OutputFile) {
+    try {
+        # Clear ReadOnly first, mirroring what Remove-Item -Force would do later,
+        # so a read-only file is not a false alarm here.
+        $attr = Get-Item -LiteralPath $OutputFile -Force
+        if ($attr -is [System.IO.FileInfo] -and $attr.IsReadOnly) { $attr.IsReadOnly = $false }
+        $probeStream = [System.IO.File]::Open($OutputFile,
+            [System.IO.FileMode]::Open, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+        $probeStream.Dispose()
+    }
+    catch { Fail "Cannot write '$OutputFile'. Is the file open in another program? ($($_.Exception.Message))" }
+}
+
 # --- Scan ----------------------------------------------------------------------
 
 Write-Host "Scanning..." -ForegroundColor Cyan
@@ -131,45 +161,32 @@ Write-Host "Found $($allDirs.Count) $dirNoun." -ForegroundColor Cyan
 
 $childrenOf = @{}
 foreach ($d in $allDirs) {
-    $parentPath = $rootNorm
-    if ($d.Parent) { $parentPath = $d.Parent.FullName }
-    $list = $childrenOf[$parentPath]
-    if (-not $list) {
-        $list = New-Object System.Collections.ArrayList
-        $childrenOf[$parentPath] = $list
-    }
-    [void]$list.Add($d)
+    $parentPath = if ($d.Parent) { $d.Parent.FullName } else { $rootNorm }
+    if (-not $childrenOf.ContainsKey($parentPath)) { $childrenOf[$parentPath] = [System.Collections.Generic.List[object]]::new() }
+    $childrenOf[$parentPath].Add($d)
 }
 foreach ($key in @($childrenOf.Keys)) {
-    $childrenOf[$key] = @($childrenOf[$key] | Sort-Object -Property Name)
+    $childrenOf[$key] = @($childrenOf[$key] | Sort-Object -Property Name -Descending)
 }
 
-$ordered = New-Object System.Collections.Generic.List[object]
-$stack   = New-Object System.Collections.Generic.Stack[object]
-$rootKids = $childrenOf[$rootNorm]
-if ($rootKids) {
-    for ($i = $rootKids.Count - 1; $i -ge 0; $i--) { [void]$stack.Push($rootKids[$i]) }
-}
+$ordered = [System.Collections.Generic.List[object]]::new()
+$stack   = [System.Collections.Generic.Stack[object]]::new()
+foreach ($d in $childrenOf[$rootNorm]) { $stack.Push($d) }
 while ($stack.Count -gt 0) {
     $d = $stack.Pop()
-    [void]$ordered.Add($d)
-    $kids = $childrenOf[$d.FullName]
-    if ($kids) {
-        for ($i = $kids.Count - 1; $i -ge 0; $i--) { [void]$stack.Push($kids[$i]) }
-    }
+    $ordered.Add($d)
+    foreach ($kid in $childrenOf[$d.FullName]) { $stack.Push($kid) }
 }
 # Safety net: append anything the tree walk could not reach
 if ($ordered.Count -lt $allDirs.Count) {
     $seen = @{}
     foreach ($d in $ordered) { $seen[$d.FullName] = $true }
     foreach ($d in ($allDirs | Sort-Object -Property FullName)) {
-        if (-not $seen.ContainsKey($d.FullName)) { [void]$ordered.Add($d) }
+        if (-not $seen.ContainsKey($d.FullName)) { $ordered.Add($d) }
     }
 }
 
-# --- Build the document XML ----------------------------------------------------
-
-$header = New-Object System.Text.StringBuilder 4096
+# --- Build the document header ---------------------------------------------------
 
 $isSimple = ($Format -eq 'Simple')
 if ($isSimple) {
@@ -177,46 +194,20 @@ if ($isSimple) {
     $plainPpr = '<w:spacing w:before="0" w:after="0" w:line="240" w:lineRule="auto"/>'
 }
 
-if ($isSimple) {
-    [void]$header.Append(
-        '<w:p><w:pPr>' + $plainPpr + '</w:pPr>' +
-        '<w:r><w:rPr>' + $plainRpr + '</w:rPr>' +
-        '<w:t xml:space="preserve">' + (Esc $Title) + '</w:t></w:r></w:p>'
-    )
-    [void]$header.Append(
-        '<w:p><w:pPr>' + $plainPpr + '</w:pPr>' +
-        '<w:r><w:rPr>' + $plainRpr + '</w:rPr>' +
-        '<w:t xml:space="preserve">' + (Esc $Directory) + '</w:t></w:r></w:p>'
-    )
-    [void]$header.Append(
-        '<w:p><w:pPr>' + $plainPpr + '</w:pPr>' +
-        '<w:r><w:rPr>' + $plainRpr + '</w:rPr>' +
-        '<w:t xml:space="preserve">Generated ' + (Get-Date -Format 'yyyy-MM-dd HH:mm') +
-        ' - ' + $ordered.Count + ' ' + $dirNoun + '</w:t></w:r></w:p>'
-    )
-    [void]$header.Append('<w:p><w:pPr>' + $plainPpr + '</w:pPr></w:p>')
-}
-else {
-    [void]$header.Append(
-        '<w:p><w:pPr><w:jc w:val="center"/><w:spacing w:after="120"/></w:pPr>' +
-        '<w:r><w:rPr><w:b/><w:sz w:val="36"/><w:szCs w:val="36"/></w:rPr>' +
-        '<w:t xml:space="preserve">' + (Esc $Title) + '</w:t></w:r></w:p>'
-    )
-    [void]$header.Append(
-        '<w:p><w:pPr><w:jc w:val="center"/><w:spacing w:after="60"/></w:pPr>' +
-        '<w:r><w:rPr><w:color w:val="595959"/><w:sz w:val="20"/><w:szCs w:val="20"/></w:rPr>' +
-        '<w:t xml:space="preserve">' + (Esc $Directory) + '</w:t></w:r></w:p>'
-    )
-    [void]$header.Append(
-        '<w:p><w:pPr><w:jc w:val="center"/><w:spacing w:after="200"/></w:pPr>' +
-        '<w:r><w:rPr><w:i/><w:color w:val="808080"/><w:sz w:val="18"/><w:szCs w:val="18"/></w:rPr>' +
-        '<w:t xml:space="preserve">Generated ' + (Get-Date -Format 'yyyy-MM-dd HH:mm') +
-        ' - ' + $ordered.Count + ' ' + $dirNoun + '</w:t></w:r></w:p>'
-    )
-    [void]$header.Append(
-        '<w:p><w:pPr><w:pBdr><w:bottom w:val="single" w:sz="6" w:space="1" w:color="BFBFBF"/></w:pBdr>' +
-        '<w:spacing w:after="240"/></w:pPr></w:p>'
-    )
+# Function emitting the header paragraphs, so both formats share one code path.
+function Write-Header($Writer) {
+    if ($script:isSimple) {
+        Write-Para $Writer $script:Title  $script:plainRpr $script:plainPpr
+        Write-Para $Writer $script:Directory $script:plainRpr $script:plainPpr
+        Write-Para $Writer ("Generated {0} - {1} {2}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm'), $script:ordered.Count, $script:dirNoun) $script:plainRpr $script:plainPpr
+        Write-Para $Writer '' $null $script:plainPpr
+    }
+    else {
+        Write-Para $Writer $script:Title ('<w:b/><w:sz w:val="36"/><w:szCs w:val="36"/>') ('<w:jc w:val="center"/><w:spacing w:after="120"/>')
+        Write-Para $Writer $script:Directory ('<w:color w:val="595959"/><w:sz w:val="20"/><w:szCs w:val="20"/>') ('<w:jc w:val="center"/><w:spacing w:after="60"/>')
+        Write-Para $Writer ("Generated {0} - {1} {2}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm'), $script:ordered.Count, $script:dirNoun) ('<w:i/><w:color w:val="808080"/><w:sz w:val="18"/><w:szCs w:val="18"/>') ('<w:jc w:val="center"/><w:spacing w:after="200"/>')
+        Write-Para $Writer '' $null ('<w:pBdr><w:bottom w:val="single" w:sz="6" w:space="1" w:color="BFBFBF"/></w:pBdr><w:spacing w:after="240"/>')
+    }
 }
 
 if ($isSimple) {
@@ -249,8 +240,7 @@ $stylesXml = (
 # purpose: on .NET Framework it buffers parts in isolated storage and fails on
 # large documents with "Unable to determine the identity of domain".
 
-Add-Type -AssemblyName System.IO.Compression
-Add-Type -AssemblyName System.IO.Compression.FileSystem
+Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem
 
 $ctMain    = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml'
 $ctStyles  = 'application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml'
@@ -328,34 +318,23 @@ try {
     try {
         $docWriter.Write('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>')
         $docWriter.Write('<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>')
-        $docWriter.Write($header.ToString())
+        Write-Header $docWriter
 
         if ($ordered.Count -eq 0) {
             if ($isSimple) {
-                $docWriter.Write(
-                    '<w:p><w:pPr>' + $plainPpr + '</w:pPr>' +
-                    '<w:r><w:rPr>' + $plainRpr + '</w:rPr>' +
-                    '<w:t xml:space="preserve">(no subdirectories)</w:t></w:r></w:p>')
+                Write-Para $docWriter '(no subdirectories)' $plainRpr $plainPpr
             }
             else {
-                $docWriter.Write(
-                    '<w:p><w:pPr><w:spacing w:before="120"/></w:pPr>' +
-                    '<w:r><w:rPr><w:i/><w:color w:val="808080"/></w:rPr>' +
-                    '<w:t xml:space="preserve">(no subdirectories)</w:t></w:r></w:p>')
+                Write-Para $docWriter '(no subdirectories)' ('<w:i/><w:color w:val="808080"/>') ('<w:spacing w:before="120"/>')
             }
         }
         else {
             $indentStep = 360   # twips per level (0.25 inch)
             foreach ($d in $ordered) {
-                $rel   = $d.FullName.Substring($rootNorm.Length).TrimStart('\')
-                $depth = $rel.Split('\').Count
-                if ($depth -lt 1) { $depth = 1 }
+                $rel   = $d.FullName.Substring([Math]::Max(0, $rootNorm.Length)).TrimStart('\')
+                $depth = [Math]::Max(1, $rel.Split('\').Count)
                 if ($isSimple) {
-                    $docWriter.Write(
-                        '<w:p><w:pPr>' + $plainPpr + '</w:pPr>' +
-                        '<w:r><w:rPr>' + $plainRpr + '</w:rPr>' +
-                        '<w:t xml:space="preserve">' + ('  ' * ($depth - 1)) +
-                        (Esc $d.Name) + '</w:t></w:r></w:p>')
+                    Write-Para $docWriter (('  ' * ($depth - 1)) + $d.Name) $plainRpr $plainPpr
                 }
                 else {
                     $indent = ($depth - 1) * $indentStep
@@ -368,11 +347,7 @@ try {
                     else {
                         $rpr = '<w:sz w:val="20"/><w:szCs w:val="20"/>'; $before = '20'
                     }
-                    $docWriter.Write(
-                        '<w:p><w:pPr><w:spacing w:before="' + $before + '" w:after="0"/>' +
-                        '<w:ind w:left="' + $indent + '"/></w:pPr>' +
-                        '<w:r><w:rPr>' + $rpr + '</w:rPr>' +
-                        '<w:t xml:space="preserve">' + (Esc $d.Name) + '</w:t></w:r></w:p>')
+                    Write-Para $docWriter $d.Name $rpr ('<w:spacing w:before="' + $before + '" w:after="0"/><w:ind w:left="' + $indent + '"/>')
                 }
             }
         }
